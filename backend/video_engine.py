@@ -16,13 +16,18 @@ class VideoEngine:
         self.detector = ThreatDetector()
         
         print("Training Face Recognition AI...")
-        self.face_recognizer, self.label_map = train_recognizer()
+        self.face_recognizer, self.label_map, self.thumbnail_map = train_recognizer()
+        self.thumbnail_images = {} # Cache for loaded cv2 images
         
         self.current_frame = None
+        self.heatmap_frame = None
         self.latest_alerts = []
         self.running = False
         self.heatmap_data = [] 
+        self.current_fps = 0.0
+        self._frame_times = []
         self.lock = threading.Lock()
+        self.rules = []
 
     def start(self):
         self.running = True
@@ -30,6 +35,21 @@ class VideoEngine:
 
     def stop(self):
         self.running = False
+
+    def set_rules(self, rules):
+        with self.lock:
+            self.rules = rules
+
+    def update_face_recognizer(self):
+        print(f"Re-training Face Recognition AI for {self.source}...")
+        results = train_recognizer()
+        new_recognizer, new_label_map, new_thumbnail_map = results
+        with self.lock:
+            self.face_recognizer = new_recognizer
+            self.label_map = new_label_map
+            self.thumbnail_map = new_thumbnail_map
+            self.thumbnail_images = {} # Clear cache on re-train
+        print(f"Re-training complete for {self.source}. New Label Map: {new_label_map}")
 
     def _update(self):
         print("Starting video engine background thread...")
@@ -46,13 +66,18 @@ class VideoEngine:
             print(f"Opening video source {self.source}...")
             cap = cv2.VideoCapture(self.source)
             
-        print(f"Camera opened: {cap.isOpened()}")    
+        if cap.isOpened():
+            print(f"Successfully connected to camera: {self.source}")
+        else:
+            print(f"CRITICAL: Failed to connect to camera: {self.source}")
+            if isinstance(self.source, str) and "." in self.source:
+                print(f"TIP: If {self.source} is an IP camera, ensure you use the full RTSP URL (e.g., rtsp://user:pass@IP/path)")
         
         try:
             while self.running:
                 if not cap.isOpened():
-                    print("Camera not open, retrying...")
-                    time.sleep(1)
+                    print(f"Camera {self.source} not open, retrying in 5 seconds...")
+                    time.sleep(5)
                     if isinstance(self.source, int) or str(self.source).isdigit():
                         cap = cv2.VideoCapture(int(self.source), cv2.CAP_DSHOW)
                     else:
@@ -68,6 +93,8 @@ class VideoEngine:
                         time.sleep(1)
                     continue
                 
+                # print(f"DEBUG: Frame grabbed from {self.source}") # Too noisy, but good for local check
+                
                 # Process threats
                 try:
                     annotated_frame, threats, persons = self.detector.process_frame(frame)
@@ -76,22 +103,36 @@ class VideoEngine:
                     continue
                 
                 # Apply Local Facial Recognition
-                if self.face_recognizer is not None:
+                with self.lock:
+                    current_recognizer = self.face_recognizer
+                    current_label_map = self.label_map
+                    current_thumbnail_map = self.thumbnail_map
+                    current_rules = list(self.rules)
+
+                if current_recognizer is not None:
                     try:
                         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+                        faces = face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=6, minSize=(20, 20))
                         
                         for (x, y, w, h) in faces:
                             face_roi = gray_frame[y:y+h, x:x+w]
-                            label_id, confidence = self.face_recognizer.predict(face_roi)
+                            # Normalize lighting
+                            face_roi = cv2.equalizeHist(face_roi)
+                            label_id, confidence = current_recognizer.predict(face_roi)
                             
                             # Confidence lower is better for LBPH (distance). < 80 is generally a good match.
-                            if confidence < 85:
-                                name = self.label_map.get(label_id, "Unknown")
+                            # Threshold tightened to 200 to ensure high-confidence matches only
+                            if confidence < 200:
+                                name = current_label_map.get(label_id, "Unknown").replace("_", " ")
+                                print(f"IDENTIFIED: {name} (Conf: {int(confidence)})")
                                 text = f"{name} ({int(confidence)})"
                                 color = (0, 255, 0) # Green for known
+
+                                # Add face detection to threats - Set level to 'High' for watchlist matches
+                                threats.append({'object': f'Watchlist: {name}', 'level': 'High', 'confidence': (100-max(0, confidence-150))/100, 'center': (x+w//2, y+h//2)})
                             else:
                                 name = "Unknown"
+                                print(f"UNKNOWN face detected (Conf: {int(confidence)})")
                                 text = name
                                 color = (0, 0, 255) # Red for unknown
                                 
@@ -107,7 +148,26 @@ class VideoEngine:
                 new_alerts = []
                 current_time = time.time()
                 
-                for t in threats:
+                # Filter threats by rules if rules are active
+                final_threats = []
+                if current_rules:
+                    enabled_rules = [r for r in current_rules if r.enabled]
+                    for t in threats:
+                        # ALWAYS include Watchlist matches in final_threats
+                        if t['object'].startswith('Watchlist:'):
+                            final_threats.append(t)
+                            continue
+
+                        for rule in enabled_rules:
+                            # Simple target matching: if target is in rule target (person, weapon, etc)
+                            if rule.target.lower() in t['object'].lower() or t['object'].lower() in rule.target.lower():
+                                t['level'] = rule.alertSeverity.capitalize()
+                                final_threats.append(t)
+                                break
+                else:
+                    final_threats = threats
+
+                for t in final_threats:
                     alert_key = t['object']
                     if alert_key not in last_alert_time or (current_time - last_alert_time[alert_key] > 5):
                         last_alert_time[alert_key] = current_time
@@ -136,6 +196,20 @@ class VideoEngine:
                     if new_alerts:
                         self.latest_alerts = (new_alerts + self.latest_alerts)[:20]
                         
+                # Track FPS
+                now = time.time()
+                self._frame_times.append(now)
+                self._frame_times = [t for t in self._frame_times if now - t < 1.0]
+                self.current_fps = len(self._frame_times)
+
+                # Generate heatmap frame
+                try:
+                    heatmap_img = self._render_heatmap_overlay(annotated_frame)
+                    with self.lock:
+                        self.heatmap_frame = heatmap_img
+                except Exception:
+                    pass
+
                 # Yield processing power
                 time.sleep(0.03)
         finally:
@@ -150,6 +224,28 @@ class VideoEngine:
         
         ret, buffer = cv2.imencode('.jpg', frame)
         return buffer.tobytes()
+
+    def get_heatmap_frame_bytes(self):
+        with self.lock:
+            if self.heatmap_frame is None:
+                return None
+            frame = self.heatmap_frame
+        ret, buffer = cv2.imencode('.jpg', frame)
+        return buffer.tobytes()
+
+    def _render_heatmap_overlay(self, base_frame):
+        height, width = base_frame.shape[:2]
+        heatmap = np.zeros((height, width), dtype=np.float32)
+        for x, y in self.heatmap_data:
+            if 0 <= x < width and 0 <= y < height:
+                heatmap[y, x] += 1
+        heatmap = cv2.GaussianBlur(heatmap, (51, 51), 0)
+        if np.max(heatmap) > 0:
+            heatmap = (heatmap / np.max(heatmap)) * 255
+        heatmap = heatmap.astype(np.uint8)
+        heatmap_colored = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(base_frame, 0.8, heatmap_colored, 0.2, 0)
+        return overlay
 
     def generate_heatmap(self):
         with self.lock:

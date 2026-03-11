@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 sqlalchemy
-opencv-python
+opencv-contrib-python
 ultralytics
 numpy
 matplotlib
